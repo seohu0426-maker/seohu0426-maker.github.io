@@ -1,1 +1,0 @@
-# seohu0426-maker.github.io
