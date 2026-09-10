@@ -558,6 +558,1805 @@
   <div class="controls">
     <button id="btn-reset">새 게임</button>
     <button id="btn-undo">한 수 무르기</button>
+    <button id="btn-reset-learn" style="display:none;">AI 전적 초기화</button>
+  </div>
+
+  <div style="width:min(760px,100%);display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;font-family:'DM Mono',monospace;font-size:.72rem;">
+    <label>게임 모드
+      <select id="mode" style="width:100%;margin-top:4px;padding:7px;background:transparent;color:var(--text);border:1px solid var(--border);border-radius:2px;">
+        <option value="ai">사람 vs AI</option>
+        <option value="pvp">사람 vs 사람</option>
+      </select>
+    </label>
+    <label>AI 난이도
+      <select id="difficulty" style="width:100%;margin-top:4px;padding:7px;background:transparent;color:var(--text);border:1px solid var(--border);border-radius:2px;">
+        <option value="easy">약함</option>
+        <option value="normal">보통</option>
+        <option value="hard" selected>강함</option>
+        <option value="master">최강</option>
+      </select>
+    </label>
+    <label>선공
+      <select id="side" style="width:100%;margin-top:4px;padding:7px;background:transparent;color:var(--text);border:1px solid var(--border);border-radius:2px;">
+        <option value="1">홍 — 내가 선공</option>
+        <option value="2">청 — AI가 선공</option>
+      </select>
+    </label>
+    <div style="padding:7px;border:1px solid var(--border);">
+      <div id="learnRecord">[서버 연동] AI 0전 0승 0패</div>
+      <div id="engineInfo" style="margin-top:4px;">AI 대기 중</div>
+    </div>
+  </div>
+
+  <div id="rules-panel" style="width:min(760px,100%);font-size:.72rem;line-height:1.55;color:var(--text-dim);border-top:1px solid var(--border);padding-top:10px;">
+    <b style="color:var(--text);">더배틀 규칙 적용</b><br>
+    가로·세로·대각선(이 BOKU 보드의 3축)으로 자신의 말 5개 이상 연속 → 승리<br>
+    내-적-적-내 → 가운데 2개 중 하나 선택 제거 / 돌을 놓은 것이 한 수이며 제거는 수가 아님<br>
+    제거하자마자 무조건 상대 차례 / 제거된 자리는 상대방 딱 한 차례만 배치 금지<br>
+    그 다음부터는 다시 배치 가능 / 이전에 샌드위치된 자리도 다시 샌드위치 가능<br>
+    보드의 모든 칸이 채워지면 무승부 처리됩니다.<br>
+    사람 vs AI 대국 결과는 난이도별 AI 전적으로 서버에 기록됩니다.
+  </div>
+
+  <div id="game-log" style="width:min(760px,100%);height:120px;overflow:auto;background:var(--surface);border:1px solid var(--border);padding:8px;font-size:.68rem;line-height:1.5;color:var(--text-dim);"></div>
+</div>
+
+<!-- ============ 가입자 목록 오버레이 ============ -->
+<div class="overlay" id="user-list-overlay">
+  <div class="overlay-box">
+    <h2>가입자 목록</h2>
+    <p class="panel-desc" id="user-list-desc">
+      현재 서버에 가입된 모든 유저입니다.
+    </p>
+    <div class="admin-list" id="user-list-content"></div>
+    <button class="close-btn" id="user-list-close">닫기</button>
+  </div>
+</div>
+
+<script>
+/* ============================================================
+   0) BOKU 엔진 — 웹 워커에서 실행 (화면 안 멈춤)
+   ============================================================ */
+function BokuEngineFactory() {
+  "use strict";
+  // ---------- 보드 기하 (UI의 CELLS 순서와 동일) ----------
+  const WIDTHS = [5, 6, 7, 8, 9, 10, 9, 8, 7, 6, 5], MID = 5;
+  const Q = [], Z = [], idx = new Map();
+  for (let i = 0; i < WIDTHS.length; i++) {
+    const w = WIDTHS[i], z = i - MID, start = -(w - 1);
+    for (let j = 0; j < w; j++) { const q = start + 2 * j; idx.set(q + "," + z, Q.length); Q.push(q); Z.push(z); }
+  }
+  const N = Q.length;
+  const DQ = [2, -2, 1, -1, -1, 1], DZ = [0, 0, 1, -1, 1, -1];
+  const NBR = new Int16Array(6 * N);
+  for (let d = 0; d < 6; d++) for (let i = 0; i < N; i++) {
+    const k = (Q[i] + DQ[d]) + "," + (Z[i] + DZ[d]);
+    NBR[d * N + i] = idx.has(k) ? idx.get(k) : -1;
+  }
+  function hexDist(i, j) {
+    const a1 = (Q[i] + Z[i]) / 2, b1 = Z[i], a2 = (Q[j] + Z[j]) / 2, b2 = Z[j];
+    const da = a1 - a2, db = b1 - b2;
+    return Math.max(Math.abs(da), Math.abs(db), Math.abs(da - db));
+  }
+
+  // 5칸 창(window)
+  const wins = [];
+  for (const d of [0, 2, 4]) for (let i = 0; i < N; i++) {
+    const cs = [i]; let c = i, ok = true;
+    for (let k = 1; k < 5; k++) { c = NBR[d * N + c]; if (c < 0) { ok = false; break; } cs.push(c); }
+    if (ok) wins.push(cs);
+  }
+  const W = wins.length;
+  const WC = new Int16Array(W * 5);
+  wins.forEach((cs, w) => cs.forEach((c, k) => { WC[w * 5 + k] = c; }));
+  const cwTmp = Array.from({ length: N }, () => []);
+  wins.forEach((cs, w) => cs.forEach((c) => cwTmp[c].push(w)));
+  const CWS = new Int16Array(N + 1), CWL = [];
+  for (let i = 0; i < N; i++) { CWS[i] = CWL.length; CWL.push(...cwTmp[i]); }
+  CWS[N] = CWL.length;
+  const CW = Int16Array.from(CWL);
+  // 창 중심성(오프닝용)
+  const centrality = cwTmp.map((l) => l.length);
+
+  // 4칸 구간(따먹기 위협 평가용)
+  const segs = [];
+  for (const d of [0, 2, 4]) for (let i = 0; i < N; i++) {
+    const cs = [i]; let c = i, ok = true;
+    for (let k = 1; k < 4; k++) { c = NBR[d * N + c]; if (c < 0) { ok = false; break; } cs.push(c); }
+    if (ok) segs.push(cs);
+  }
+  const SG = Int16Array.from(segs.flat()), NS = segs.length;
+
+  // 거리 2 이내 이웃
+  const NEAR = [];
+  for (let i = 0; i < N; i++) { const l = []; for (let j = 0; j < N; j++) if (j !== i && hexDist(i, j) <= 2) l.push(j); NEAR.push(Int16Array.from(l)); }
+
+  // ---------- 상태 ----------
+  const board = new Int8Array(N);
+  const cnt = [null, new Int8Array(W), new Int8Array(W)];
+  const sc = [0, 0, 0], four = [0, 0, 0];
+  const V = [0, 2, 16, 120, 1000, 1000];
+  const HV = [2, 14, 104, 880, 100000];
+  let blocked = -1, stones = 0;
+
+  let seed = 0x9e3779b9 | 0;
+  function rnd32() { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return seed | 0; }
+  const Z1 = new Int32Array(3 * N), Z2 = new Int32Array(3 * N);
+  const B1 = new Int32Array(N), B2 = new Int32Array(N);
+  for (let i = 0; i < 3 * N; i++) { Z1[i] = rnd32(); Z2[i] = rnd32(); }
+  for (let i = 0; i < N; i++) { B1[i] = rnd32(); B2[i] = rnd32(); }
+  const S1 = rnd32(), S2 = rnd32();
+  let h1 = 0, h2 = 0;
+
+  function place(i, p) {
+    const o = 3 - p, cp = cnt[p], co = cnt[o];
+    board[i] = p; stones++;
+    h1 ^= Z1[p * N + i]; h2 ^= Z2[p * N + i];
+    for (let k = CWS[i], e = CWS[i + 1]; k < e; k++) {
+      const w = CW[k], a = cp[w], b = co[w];
+      if (b === 0) { sc[p] += V[a + 1] - V[a]; if (a === 3) four[p]++; else if (a === 4) four[p]--; }
+      if (a === 0) { sc[o] -= V[b]; if (b === 4) four[o]--; }
+      cp[w] = a + 1;
+    }
+  }
+  function unplace(i) {
+    const p = board[i], o = 3 - p, cp = cnt[p], co = cnt[o];
+    for (let k = CWS[i], e = CWS[i + 1]; k < e; k++) {
+      const w = CW[k], a = cp[w], b = co[w];
+      cp[w] = a - 1;
+      if (b === 0) { sc[p] += V[a - 1] - V[a]; if (a === 4) four[p]--; else if (a === 5) four[p]++; }
+      if (a === 1) { sc[o] += V[b]; if (b === 4) four[o]++; }
+    }
+    board[i] = 0; stones--;
+    h1 ^= Z1[p * N + i]; h2 ^= Z2[p * N + i];
+  }
+  function setBlocked(b) {
+    if (blocked >= 0) { h1 ^= B1[blocked]; h2 ^= B2[blocked]; }
+    blocked = b;
+    if (blocked >= 0) { h1 ^= B1[blocked]; h2 ^= B2[blocked]; }
+  }
+
+  // m = i | ((r+1) << 7)
+  const blockedStack = new Int16Array(512);
+  let bsp = 0;
+  function make(m, p) {
+    const i = m & 127, r = (m >> 7) - 1;
+    place(i, p);
+    if (r >= 0) unplace(r);
+    blockedStack[bsp++] = blocked;
+    setBlocked(r);
+    h1 ^= S1; h2 ^= S2;
+  }
+  function unmake(m, p) {
+    const i = m & 127, r = (m >> 7) - 1;
+    h1 ^= S1; h2 ^= S2;
+    setBlocked(blockedStack[--bsp]);
+    if (r >= 0) place(r, 3 - p);
+    unplace(i);
+  }
+
+  function capList(i, p, out) {
+    const o = 3 - p; let n = 0;
+    for (let d = 0; d < 6; d++) {
+      const a = NBR[d * N + i]; if (a < 0 || board[a] !== o) continue;
+      const b = NBR[d * N + a]; if (b < 0 || board[b] !== o) continue;
+      const c = NBR[d * N + b]; if (c < 0 || board[c] !== p) continue;
+      let ha = false, hb = false;
+      for (let k = 0; k < n; k++) { if (out[k] === a) ha = true; if (out[k] === b) hb = true; }
+      if (!ha) out[n++] = a;
+      if (!hb) out[n++] = b;
+    }
+    return n;
+  }
+
+  function winCells(p, out) {
+    const o = 3 - p, cp = cnt[p], co = cnt[o]; let n = 0;
+    if (four[p] <= 0) return 0;
+    for (let w = 0; w < W; w++) {
+      if (cp[w] !== 4 || co[w] !== 0) continue;
+      for (let k = 0; k < 5; k++) {
+        const c = WC[w * 5 + k];
+        if (board[c] === 0) {
+          let dup = false; for (let t = 0; t < n; t++) if (out[t] === c) { dup = true; break; }
+          if (!dup) out[n++] = c;
+          break;
+        }
+      }
+    }
+    return n;
+  }
+  const tmpWin = new Int16Array(128);
+  function hasImmediateWin(p) {
+    if (four[p] <= 0) return -1;
+    const n = winCells(p, tmpWin);
+    for (let k = 0; k < n; k++) if (tmpWin[k] !== blocked) return tmpWin[k];
+    return -1;
+  }
+
+  function evalStatic(p) {
+    const o = 3 - p;
+    let e = sc[p] * 1.2 - sc[o];
+    for (let s = 0; s < NS; s++) {
+      const a = board[SG[s * 4]], b = board[SG[s * 4 + 1]], c = board[SG[s * 4 + 2]], d = board[SG[s * 4 + 3]];
+      if (b === 0 || b !== c) continue;
+      const Y = 3 - b;
+      let empty = -1;
+      if (a === Y && d === 0) empty = SG[s * 4 + 3];
+      else if (d === Y && a === 0) empty = SG[s * 4];
+      else continue;
+      let rev = 0;
+      const X = b, cy = cnt[Y], cx = cnt[X];
+      for (let t = 1; t <= 2; t++) {
+        const st = SG[s * 4 + t];
+        for (let k = CWS[st], ke = CWS[st + 1]; k < ke; k++) { const w = CW[k]; if (cy[w] === 4 && cx[w] === 1) rev = 1; }
+      }
+      if (Y === p) e += (empty === blocked ? 30 : rev ? 5000 : 70);
+      else e -= rev ? 2500 : 30;
+    }
+    return Math.round(e + noiseOf());
+  }
+  let noiseAmp = 0;
+  function noiseOf() {
+    if (!noiseAmp) return 0;
+    let x = (h1 ^ (h2 >>> 7)) | 0; x ^= x << 13; x ^= x >>> 17; x ^= x << 5;
+    return ((x & 1023) / 1023 - 0.5) * noiseAmp;
+  }
+
+  function heur(i, p) {
+    const o = 3 - p, cp = cnt[p], co = cnt[o];
+    let att = 0, def = 0;
+    for (let k = CWS[i], e = CWS[i + 1]; k < e; k++) {
+      const w = CW[k], a = cp[w], b = co[w];
+      if (b === 0) att += HV[a];
+      if (a === 0) def += HV[b];
+    }
+    return att + def * 0.9;
+  }
+  function removeValue(r, p) {
+    const o = 3 - p, cp = cnt[p], co = cnt[o];
+    let v = 0;
+    for (let k = CWS[r], e = CWS[r + 1]; k < e; k++) {
+      const w = CW[k];
+      if (cp[w] === 0) v += V[co[w]] - V[co[w] - 1];
+    }
+    return v;
+  }
+
+  function reviveValue(r, p) {
+    const o = 3 - p, cp = cnt[p], co = cnt[o];
+    let v = 0;
+    for (let k = CWS[r], e = CWS[r + 1]; k < e; k++) {
+      const w = CW[k];
+      if (co[w] === 1) { const a = cp[w]; v += a === 4 ? 60000 : a === 3 ? 800 : V[a]; }
+    }
+    return v;
+  }
+  const capBuf2 = new Int16Array(16);
+  function oppCaptureValue(i, p) {
+    const o = 3 - p, nc = capList(i, o, capBuf2);
+    if (nc === 0) return 0;
+    let best = 0;
+    for (let k = 0; k < nc; k++) { const v = removeValue(capBuf2[k], o) + reviveValue(capBuf2[k], o); if (v > best) best = v; }
+    return 300 + best;
+  }
+
+  const hist = new Int32Array(128 * 82);
+  const capBuf = new Int16Array(16);
+  const mark = new Int32Array(N); let stamp = 1;
+
+  function pushPlacement(i, p, ms, ss, n, bonus) {
+    const h = heur(i, p) + bonus + 0.9 * oppCaptureValue(i, p);
+    const nc = capList(i, p, capBuf);
+    if (nc === 0) { ms[n] = i; ss[n] = h + Math.min(hist[i], 600); return n + 1; }
+    for (let k = 0; k < nc; k++) {
+      const r = capBuf[k], m = i | ((r + 1) << 7);
+      ms[n] = m; ss[n] = h + 400 + removeValue(r, p) + reviveValue(r, p) + Math.min(hist[m], 600); n++;
+    }
+    return n;
+  }
+  function sortMoves(ms, ss, n, first) {
+    if (first) for (let k = 0; k < n; k++) if (ms[k] === first) { ss[k] = 1e12; break; }
+    for (let a = 1; a < n; a++) {
+      const m = ms[a], s = ss[a]; let b = a - 1;
+      while (b >= 0 && ss[b] < s) { ms[b + 1] = ms[b]; ss[b + 1] = ss[b]; b--; }
+      ms[b + 1] = m; ss[b + 1] = s;
+    }
+  }
+  function genNormal(p, ms, ss) {
+    let n = 0; stamp++;
+    if (stones === 0) {
+      for (let i = 0; i < N; i++) if (i !== blocked) { ms[n] = i; ss[n] = centrality[i]; n++; }
+      return n;
+    }
+    for (let s = 0; s < N; s++) {
+      if (board[s] === 0) continue;
+      const nl = NEAR[s];
+      for (let k = 0; k < nl.length; k++) {
+        const c = nl[k];
+        if (board[c] !== 0 || c === blocked || mark[c] === stamp) continue;
+        mark[c] = stamp;
+        n = pushPlacement(c, p, ms, ss, n, 0);
+      }
+    }
+    return n;
+  }
+  function genForced(p, oppL, nL, ms, ss) {
+    let n = 0; stamp++;
+    for (let k = 0; k < nL; k++) {
+      const c = oppL[k];
+      if (c === blocked || board[c] !== 0 || mark[c] === stamp) continue;
+      mark[c] = stamp;
+      n = pushPlacement(c, p, ms, ss, n, 50000);
+    }
+    for (let i = 0; i < N; i++) {
+      if (board[i] !== 0 || i === blocked || mark[i] === stamp) continue;
+      if (capList(i, p, capBuf) > 0) { mark[i] = stamp; n = pushPlacement(i, p, ms, ss, n, 0); }
+    }
+    return n;
+  }
+  function genFourMakers(p, ms, ss) {
+    const o = 3 - p, cp = cnt[p], co = cnt[o];
+    let n = 0; stamp++;
+    for (let w = 0; w < W; w++) {
+      if (cp[w] !== 3 || co[w] !== 0) continue;
+      for (let k = 0; k < 5; k++) {
+        const c = WC[w * 5 + k];
+        if (board[c] !== 0 || c === blocked || mark[c] === stamp) continue;
+        mark[c] = stamp;
+        n = pushPlacement(c, p, ms, ss, n, 0);
+      }
+    }
+    // 따먹어서 내 4를 되살리는 수 (제거된 칸은 상대가 바로 못 막음)
+    for (let w = 0; w < W; w++) {
+      if (cp[w] !== 4 || co[w] !== 1) continue;
+      let r = -1;
+      for (let k = 0; k < 5; k++) { const c = WC[w * 5 + k]; if (board[c] === o) { r = c; break; } }
+      for (let d = 0; d < 6; d++) {
+        const a = NBR[d * N + r]; if (a < 0 || board[a] !== o) continue;
+        const e1 = NBR[(d ^ 1) * N + r], e2 = NBR[d * N + a];
+        if (e1 < 0 || e2 < 0) continue;
+        let tgt = -1;
+        if (board[e1] === p && board[e2] === 0) tgt = e2;
+        else if (board[e2] === p && board[e1] === 0) tgt = e1;
+        if (tgt < 0 || tgt === blocked || mark[tgt] === stamp) continue;
+        mark[tgt] = stamp;
+        n = pushPlacement(tgt, p, ms, ss, n, 0);
+      }
+    }
+    return n;
+  }
+
+  // ---------- TT ----------
+  const TT_BITS = 19, TT_SIZE = 1 << TT_BITS, TT_MASK = TT_SIZE - 1;
+  const tKey = new Int32Array(TT_SIZE), tDepth = new Int8Array(TT_SIZE), tFlag = new Int8Array(TT_SIZE);
+  const tScore = new Int32Array(TT_SIZE), tMove = new Int16Array(TT_SIZE);
+  const EXACT = 1, LOWER = 2, UPPER = 3;
+  function ttClear() { tFlag.fill(0); hist.fill(0); }
+
+  const WIN = 1000000, INF = 2000000000, MAXPLY = 60;
+  const isMate = (s) => s > WIN - 1000 || s < -WIN + 1000;
+  function toTT(s, ply) { return s > WIN - 1000 ? s + ply : s < -WIN + 1000 ? s - ply : s; }
+  function fromTT(s, ply) { return s > WIN - 1000 ? s - ply : s < -WIN + 1000 ? s + ply : s; }
+
+  let nodes = 0, deadline = 0, cfg = null, stopFlag = false;
+  const TIMEOUT = { t: 1 };
+  const MS = [], SS = [], OL = [];
+  for (let i = 0; i < MAXPLY + 20; i++) { MS.push(new Int32Array(1024)); SS.push(new Float64Array(1024)); OL.push(new Int16Array(128)); }
+
+  function tick() {
+    if ((++nodes & 1023) === 0 && Date.now() > deadline) throw TIMEOUT;
+  }
+
+  function qsearch(alpha, beta, ply, p, qd) {
+    tick();
+    if (hasImmediateWin(p) >= 0) return WIN - ply;
+    const o = 3 - p;
+    const ms = MS[ply], ss = SS[ply], ol = OL[ply];
+    const nL = four[o] > 0 ? winCells(o, ol) : 0;
+    if (nL > 0) {
+      const n = genForced(p, ol, nL, ms, ss);
+      if (n === 0) return -(WIN - ply - 1);
+      if (qd >= cfg.qmax || ply >= MAXPLY) return evalStatic(p) - 400;
+      sortMoves(ms, ss, n, 0);
+      let best = -INF;
+      for (let k = 0; k < n; k++) {
+        const m = ms[k];
+        make(m, p);
+        const s = -qsearch(-beta, -alpha, ply + 1, o, qd + 1);
+        unmake(m, p);
+        if (s > best) { best = s; if (s > alpha) { alpha = s; if (alpha >= beta) break; } }
+      }
+      return best;
+    }
+    const stand = evalStatic(p);
+    if (stand >= beta) return stand;
+    if (qd >= cfg.qmax || ply >= MAXPLY) return stand;
+    if (stand > alpha) alpha = stand;
+    let n = genFourMakers(p, ms, ss);
+    if (n === 0) return stand;
+    sortMoves(ms, ss, n, 0);
+    if (n > cfg.qwidth) n = cfg.qwidth;
+    let best = stand;
+    for (let k = 0; k < n; k++) {
+      const m = ms[k];
+      make(m, p);
+      const s = -qsearch(-beta, -alpha, ply + 1, o, qd + 1);
+      unmake(m, p);
+      if (s > best) { best = s; if (s > alpha) { alpha = s; if (alpha >= beta) break; } }
+    }
+    return best;
+  }
+
+  function search(depth, alpha, beta, ply, p) {
+    tick();
+    if (hasImmediateWin(p) >= 0) return WIN - ply;
+    if (stones >= N) return 0;
+    if (depth <= 0 || ply >= MAXPLY) return qsearch(alpha, beta, ply, p, 0);
+    const o = 3 - p;
+
+    const slot = h1 & TT_MASK;
+    let ttMove = 0;
+    if (tFlag[slot] && tKey[slot] === h2) {
+      ttMove = tMove[slot];
+      if (tDepth[slot] >= depth) {
+        const s = fromTT(tScore[slot], ply), f = tFlag[slot];
+        if (f === EXACT) return s;
+        if (f === LOWER && s >= beta) return s;
+        if (f === UPPER && s <= alpha) return s;
+      }
+    }
+
+    const ms = MS[ply], ss = SS[ply], ol = OL[ply];
+    const nL = four[o] > 0 ? winCells(o, ol) : 0;
+    const forced = nL > 0;
+    let n = forced ? genForced(p, ol, nL, ms, ss) : genNormal(p, ms, ss);
+    if (n === 0) return forced ? -(WIN - ply - 1) : 0;
+    sortMoves(ms, ss, n, ttMove);
+    if (!forced && n > cfg.beam) n = cfg.beam;
+    const newDepth = forced ? depth : depth - 1;
+
+    const a0 = alpha;
+    let best = -INF, bestMove = 0;
+    for (let k = 0; k < n; k++) {
+      const m = ms[k];
+      make(m, p);
+      let s;
+      if (k === 0) s = -search(newDepth, -beta, -alpha, ply + 1, o);
+      else {
+        s = -search(newDepth, -alpha - 1, -alpha, ply + 1, o);
+        if (s > alpha && s < beta) s = -search(newDepth, -beta, -alpha, ply + 1, o);
+      }
+      unmake(m, p);
+      if (s > best) {
+        best = s; bestMove = m;
+        if (s > alpha) { alpha = s; if (alpha >= beta) { hist[m] += depth * depth; break; } }
+      }
+    }
+    tKey[slot] = h2; tDepth[slot] = depth; tMove[slot] = bestMove;
+    tFlag[slot] = best <= a0 ? UPPER : best >= beta ? LOWER : EXACT;
+    tScore[slot] = toTT(best, ply);
+    return best;
+  }
+
+  function setup(arr, blk) {
+    board.fill(0); cnt[1].fill(0); cnt[2].fill(0);
+    sc[1] = sc[2] = 0; four[1] = four[2] = 0; stones = 0; h1 = 0; h2 = 0; blocked = -1;
+    for (let i = 0; i < N; i++) if (arr[i]) place(i, arr[i]);
+    setBlocked(blk);
+  }
+
+  // levels
+  const LEVELS = {
+    easy:   { maxDepth: 1, time: 250,  beam: 8,  qmax: 2,  qwidth: 2, noise: 900, pick: 400 },
+    normal: { maxDepth: 2, time: 500,  beam: 8,  qmax: 3,  qwidth: 3, noise: 400, pick: 180 },
+    hard:   { maxDepth: 40, time: 1500, beam: 14, qmax: 10, qwidth: 6, noise: 0, pick: 0 },
+    master: { maxDepth: 40, time: 4000, beam: 16, qmax: 12, qwidth: 8, noise: 0, pick: 0 },
+  };
+  let lastLevel = null;
+
+  function think(arr, side, blk, level, opts) {
+    opts = opts || {};
+    cfg = Object.assign({}, LEVELS[level] || LEVELS.hard, opts);
+    if (level !== lastLevel || opts.clear) { ttClear(); lastLevel = level; }
+    noiseAmp = cfg.noise;
+    hist.fill(0);
+    setup(arr, blk);
+    // side-to-move 해시: 흑/백 구분
+    if (side === 2) { h1 ^= S1; h2 ^= S2; }
+    const t0 = Date.now();
+    deadline = t0 + cfg.time;
+    nodes = 0; bsp = 0;
+    const p = side, o = 3 - p;
+    const decode = (m) => ({ i: m & 127, r: (m >> 7) - 1 });
+    const fin = (m, score, depth, why) => {
+      if (side === 2) { h1 ^= S1; h2 ^= S2; }
+      return Object.assign(decode(m), { score, depth, nodes, ms: Date.now() - t0, why });
+    };
+
+    if (stones === 0) {
+      let bestC = [], bc = -1;
+      for (let i = 0; i < N; i++) { if (centrality[i] > bc) { bc = centrality[i]; bestC = [i]; } else if (centrality[i] === bc) bestC.push(i); }
+      return fin(bestC[Math.floor(Math.random() * bestC.length)], 0, 0, "opening");
+    }
+    const wc = hasImmediateWin(p);
+    if (wc >= 0) return fin(wc, WIN, 1, "win");
+
+    const ms = new Int32Array(1024), ss = new Float64Array(1024), ol = new Int16Array(128);
+    const nL = four[o] > 0 ? winCells(o, ol) : 0;
+    let n = nL > 0 ? genForced(p, ol, nL, ms, ss) : genNormal(p, ms, ss);
+    if (n === 0) {
+      // 막을 수 없음: 아무 합법수
+      for (let i = 0; i < N; i++) if (board[i] === 0 && i !== blocked) return fin(i, -WIN, 0, "lost");
+      return fin(0, 0, 0, "none");
+    }
+    sortMoves(ms, ss, n, 0);
+    let root = [];
+    for (let k = 0; k < n; k++) root.push({ m: ms[k], s: ss[k], v: -INF });
+    if (root.length === 1) return fin(root[0].m, 0, 0, "only");
+
+    let bestM = root[0].m, bestS = -INF, doneDepth = 0;
+    const exactRoot = cfg.pick > 0;
+    try {
+      for (let d = 1; d <= cfg.maxDepth; d++) {
+        let alpha = -INF, curBest = null;
+        for (let k = 0; k < root.length; k++) {
+          const R = root[k];
+          make(R.m, p);
+          let s;
+          if (k === 0 || exactRoot) s = -search(d - 1, -INF, exactRoot ? INF : -alpha, 1, o);
+          else {
+            s = -search(d - 1, -alpha - 1, -alpha, 1, o);
+            if (s > alpha) s = -search(d - 1, -INF, -alpha, 1, o);
+          }
+          unmake(R.m, p);
+          R.v = s;
+          if (s > alpha) { alpha = s; curBest = R; }
+        }
+        root.sort((a, b) => b.v - a.v);
+        bestM = root[0].m; bestS = root[0].v; doneDepth = d;
+        if (isMate(bestS)) break;
+        if (Date.now() - t0 > cfg.time * 0.45) break;
+      }
+    } catch (e) {
+      if (e !== TIMEOUT) throw e;
+      setup(arr, blk);
+      if (side === 2) { h1 ^= S1; h2 ^= S2; }
+      bsp = 0;
+    }
+    if (cfg.pick > 0 && doneDepth > 0 && !isMate(bestS)) {
+      const pool = root.filter((R) => R.v >= bestS - cfg.pick && !isMate(R.v));
+      if (pool.length) bestM = pool[Math.floor(Math.random() * pool.length)].m;
+    }
+    return fin(bestM, bestS, doneDepth, "search");
+  }
+
+  return { think, N, Q, Z, LEVELS };
+}
+
+</script>
+
+<script>
+"use strict";
+
+const FIREBASE_DB_URL = "https://boku-d4eb3-default-rtdb.firebaseio.com";
+const USERS_KEY = "boku-users-v1";
+const SESSION_KEY = "boku-session-v1";
+
+/* ============================================================
+   1) 인증 — Firebase 서버 연동 유저 관리 시스템
+   ============================================================ */
+function loadUsersLocal() {
+  try { const v = localStorage.getItem(USERS_KEY); return v ? JSON.parse(v) : {}; } catch (e) { return {}; }
+}
+function saveUsersLocal(u) {
+  try { localStorage.setItem(USERS_KEY, JSON.stringify(u)); } catch (e) {}
+}
+
+async function loadUsersRemote() {
+  try {
+    const r = await fetch(`${FIREBASE_DB_URL}/${USERS_KEY}.json`);
+    if (r.ok) {
+      const data = await r.json();
+      const users = data || {};
+      saveUsersLocal(users); 
+      return users;
+    }
+  } catch (e) { console.error("Firebase load failed, using local DB", e); }
+  return loadUsersLocal();
+}
+
+async function saveUsersRemote(users) {
+  try {
+    const r = await fetch(`${FIREBASE_DB_URL}/${USERS_KEY}.json`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(users)
+    });
+    if (r.ok) {
+      saveUsersLocal(users);
+      return true;
+    }
+  } catch (e) {}
+  saveUsersLocal(users); 
+  return false;
+}
+
+function hashPw(pw, salt) {
+  let h = 5381;
+  const s = salt + "::" + pw;
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) >>> 0;
+  return "h" + h.toString(36);
+}
+function randomSalt() {
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
+async function signup(idRaw, pw, pw2) {
+  const id = idRaw.trim();
+  if (!id) return { ok: false, error: "아이디를 입력해주세요." };
+  if (id.length < 2 || id.length > 16) return { ok: false, error: "아이디는 2자 이상 16자 이하로 해주세요." };
+  if (!pw || pw.length < 4) return { ok: false, error: "비밀번호는 4자 이상으로 만들어주세요." };
+  if (pw !== pw2) return { ok: false, error: "비밀번호가 서로 다릅니다." };
+  
+  const users = await loadUsersRemote();
+  if (users[id]) return { ok: false, error: "이미 사용 중인 아이디입니다." };
+  
+  const isFirst = Object.keys(users).length === 0; 
+  const salt = randomSalt();
+  users[id] = { hash: hashPw(pw, salt), salt, admin: isFirst, createdAt: Date.now() };
+  
+  await saveUsersRemote(users);
+  return { ok: true, userId: id, isAdmin: isFirst };
+}
+
+async function login(idRaw, pw) {
+  const id = idRaw.trim();
+  const users = await loadUsersRemote();
+  const u = users[id];
+  if (!u || u.hash !== hashPw(pw, u.salt)) return { ok: false, error: "아이디 또는 비밀번호가 올바르지 않습니다." };
+  return { ok: true, userId: id, isAdmin: u.admin };
+}
+
+function getSession() {
+  try { return localStorage.getItem(SESSION_KEY); } catch (e) { return null; }
+}
+function setSession(id) {
+  try { if (id) localStorage.setItem(SESSION_KEY, id); else localStorage.removeItem(SESSION_KEY); } catch (e) {}
+}
+
+async function setAdminFlag(actorId, targetId, admin) {
+  const users = await loadUsersRemote();
+  if (!users[actorId] || !users[actorId].admin) return { error: "관리자만 변경할 수 있습니다." };
+  if (targetId === actorId && !admin) return { error: "본인의 관리자 권한은 해제할 수 없습니다." };
+  if (!users[targetId]) return { error: "존재하지 않는 계정입니다." };
+  
+  users[targetId].admin = admin;
+  await saveUsersRemote(users);
+  
+  if (targetId === currentUser) currentUserIsAdmin = admin;
+  return { users };
+}
+
+let currentUser = null;
+let currentUserIsAdmin = false;
+
+function currentIsAdmin() {
+  return currentUserIsAdmin;
+}
+
+const authScreen = document.getElementById("auth-screen");
+const gameScreen = document.getElementById("game-screen");
+const authTitle = document.getElementById("auth-title");
+const authDesc = document.getElementById("auth-desc");
+const authForm = document.getElementById("auth-form");
+const authId = document.getElementById("auth-id");
+const authPw = document.getElementById("auth-pw");
+const authPw2 = document.getElementById("auth-pw2");
+const authError = document.getElementById("auth-error");
+const authNote = document.getElementById("auth-note");
+const authSubmit = document.getElementById("auth-submit");
+const authSwitch = document.getElementById("auth-switch");
+
+let authTab = "signup";
+
+function renderAuth() {
+  const isSignup = authTab === "signup";
+  authTitle.textContent = isSignup ? "회원가입" : "로그인";
+  authDesc.textContent = isSignup ? "게임을 시작하려면 아이디와 비밀번호를 만들어주세요." : "가입한 계정으로 로그인해주세요.";
+  authPw2.style.display = isSignup ? "" : "none";
+  authSubmit.textContent = isSignup ? "가입하기" : "로그인";
+  authSwitch.textContent = isSignup ? "이미 계정이 있나요? 로그인" : "계정이 없나요? 회원가입";
+  authPw2.value = "";
+  authError.style.display = "none";
+}
+
+authForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  authSubmit.disabled = true;
+  authSubmit.textContent = "처리 중...";
+
+  const res = authTab === "signup" ? await signup(authId.value, authPw.value, authPw2.value) : await login(authId.value, authPw.value);
+  
+  authSubmit.disabled = false;
+  authSubmit.textContent = authTab === "signup" ? "가입하기" : "로그인";
+
+  if (!res.ok) {
+    authError.textContent = res.error;
+    authError.style.display = "block";
+    return;
+  }
+  authPw.value = "";
+  authPw2.value = "";
+  currentUserIsAdmin = res.isAdmin;
+  enterGame(res.userId);
+});
+authSwitch.addEventListener("click", () => {
+  authTab = authTab === "signup" ? "login" : "signup";
+  renderAuth();
+});
+
+function renderUserBar() {
+  const admin = currentIsAdmin();
+  document.getElementById("ub-name").textContent = currentUser;
+  document.getElementById("ub-badge").style.display = admin ? "" : "none";
+  document.getElementById("btn-reset-learn").style.display = admin ? "" : "none";
+  document.getElementById("user-bar").style.display = "flex";
+}
+
+function enterGame(userId) {
+  currentUser = userId;
+  setSession(userId);
+  authScreen.style.display = "none";
+  gameScreen.style.display = "flex";
+  renderUserBar();
+  newGame();
+  loadLearn();
+}
+
+document.getElementById("btn-logout").addEventListener("click", () => {
+  gameEpoch++; 
+  cancelEngine();
+  currentUser = null;
+  currentUserIsAdmin = false;
+  setSession(null);
+  closeUserListPanel();
+  document.getElementById("user-bar").style.display = "none";
+  gameScreen.style.display = "none";
+  authScreen.style.display = "flex";
+  renderAuth();
+});
+
+const userListOverlay = document.getElementById("user-list-overlay");
+document.getElementById("btn-user-list").addEventListener("click", async () => {
+  await renderUserList();
+  userListOverlay.classList.add("show");
+});
+document.getElementById("user-list-close").addEventListener("click", closeUserListPanel);
+userListOverlay.addEventListener("click", (e) => {
+  if (e.target === userListOverlay) closeUserListPanel();
+});
+function closeUserListPanel() { userListOverlay.classList.remove("show"); }
+
+async function renderUserList() {
+  const list = document.getElementById("user-list-content");
+  list.innerHTML = "서버에서 목록을 불러오는 중...";
+  const users = await loadUsersRemote();
+  list.innerHTML = "";
+  
+  const isAdmin = currentIsAdmin();
+  const desc = document.getElementById("user-list-desc");
+  desc.innerHTML = isAdmin ? "현재 서버에 가입된 모든 유저입니다.<br>관리자는 다른 유저의 권한을 변경할 수 있습니다." : "현재 서버에 가입된 모든 유저입니다.";
+
+  Object.entries(users).sort((a, b) => a[1].createdAt - b[1].createdAt).forEach(([id, u]) => {
+      const row = document.createElement("div");
+      row.className = "admin-row";
+      
+      const who = document.createElement("span");
+      who.className = "who";
+      who.appendChild(document.createTextNode(id));
+      
+      if (u.admin) {
+        const badge = document.createElement("span");
+        badge.className = "admin-badge";
+        badge.textContent = "관리자";
+        who.appendChild(badge);
+      }
+      if (id === currentUser) {
+        const me = document.createElement("span");
+        me.className = "me-tag";
+        me.textContent = "(나)";
+        who.appendChild(me);
+      }
+      
+      row.appendChild(who);
+
+      if (isAdmin) {
+          const btn = document.createElement("button");
+          if (u.admin) {
+            btn.textContent = "관리자 해제";
+            if (id === currentUser) {
+              btn.disabled = true;
+              btn.title = "본인의 관리자 권한은 해제할 수 없습니다.";
+            }
+            btn.addEventListener("click", async () => {
+              btn.disabled = true;
+              const r = await setAdminFlag(currentUser, id, false);
+              if (r.error) alert(r.error);
+              else { await renderUserList(); renderUserBar(); }
+            });
+          } else {
+            btn.textContent = "관리자로 지정";
+            btn.addEventListener("click", async () => {
+              btn.disabled = true;
+              const r = await setAdminFlag(currentUser, id, true);
+              if (r.error) alert(r.error);
+              else await renderUserList();
+            });
+          }
+          row.appendChild(btn);
+      }
+      
+      list.appendChild(row);
+    });
+}
+
+/* ============================================================
+   2) BOKU 게임
+   ============================================================ */
+const WIDTHS = [5, 6, 7, 8, 9, 10, 9, 8, 7, 6, 5];
+const MID = 5;
+const CELLS = [];
+const cellSet = new Set();
+const cellIndex = new Map();
+function key(q, z) { return q + "," + z; }
+for (let i = 0; i < WIDTHS.length; i++) {
+  const w = WIDTHS[i], z = i - MID, start = -(w - 1);
+  for (let j = 0; j < w; j++) {
+    const q = start + 2 * j;
+    cellIndex.set(key(q, z), CELLS.length);
+    CELLS.push({ q, z });
+    cellSet.add(key(q, z));
+  }
+}
+function exists(q, z) { return cellSet.has(key(q, z)); }
+
+const DIRS = [
+  { dq: 2, dz: 0 }, { dq: -2, dz: 0 },
+  { dq: 1, dz: 1 }, { dq: -1, dz: -1 },
+  { dq: -1, dz: 1 }, { dq: 1, dz: -1 },
+];
+const AXES = [
+  [DIRS[0], DIRS[1]], [DIRS[2], DIRS[3]], [DIRS[4], DIRS[5]],
+];
+
+const LEARN_KEY = "battle-ai-learn-v1";
+const LEVEL_KEYS = ["easy", "normal", "hard", "master"];
+
+let board = new Map(), currentPlayer = 1, gameOver = false, isDraw = false, captureMode = false;
+let captureCandidates = [], pendingGroups = [], lastPlaced = null, scores = [0, 0];
+let blockedCell = null, history = [], aiThinking = false, pendingAIRemove = null;
+let LEARN = null, learnReady = false, learnMode = "firebase";
+let gameEpoch = 0;
+
+const modeEl = document.getElementById("mode");
+const diffEl = document.getElementById("difficulty");
+const sideEl = document.getElementById("side");
+const logEl = document.getElementById("game-log");
+
+function other(p) { return p === 1 ? 2 : 1; }
+function getStone(q, z, b = board) { return b.get(key(q, z)) || 0; }
+function setStone(q, z, v, b = board) {
+  const k = key(q, z);
+  if (v === 0) b.delete(k); else b.set(k, v);
+}
+function cloneBoard(b) { return new Map(b); }
+
+function snapshot() {
+  return {
+    board: cloneBoard(board), currentPlayer, captureMode, captureCandidates: captureCandidates.slice(),
+    pendingGroups: pendingGroups.map((g) => g.slice()), lastPlaced: lastPlaced ? { ...lastPlaced } : null,
+    blockedCell: blockedCell ? { ...blockedCell } : null, scores: scores.slice(), gameOver, isDraw
+  };
+}
+function restoreSnapshot(s) {
+  board = cloneBoard(s.board); currentPlayer = s.currentPlayer; captureMode = s.captureMode;
+  captureCandidates = s.captureCandidates.slice(); pendingGroups = (s.pendingGroups || []).map((g) => g.slice());
+  lastPlaced = s.lastPlaced ? { ...s.lastPlaced } : null; blockedCell = s.blockedCell ? { ...s.blockedCell } : null;
+  scores = s.scores ? s.scores.slice() : [0, 0]; gameOver = !!s.gameOver; isDraw = !!s.isDraw; aiThinking = false;
+}
+
+function addLog(txt) {
+  if (!logEl) return;
+  logEl.innerHTML += "▸ " + txt + "<br>";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function isForbiddenToPlace(q, z) { return blockedCell && blockedCell.q === q && blockedCell.z === z; }
+
+function checkWin(q, z, player, b = board) {
+  for (const [d1, d2] of AXES) {
+    const line = [{ q, z }];
+    for (const d of [d1, d2]) {
+      for (let i = 1; i < 5; i++) {
+        const nq = q + d.dq * i, nz = z + d.dz * i;
+        if (!exists(nq, nz) || getStone(nq, nz, b) !== player) break;
+        line.push({ q: nq, z: nz });
+      }
+    }
+    if (line.length >= 5) return line;
+  }
+  return null;
+}
+
+function findCaptures(q, z, player, b = board) {
+  const opp = other(player), groups = [];
+  for (const d of DIRS) {
+    const a = { q: q + d.dq, z: z + d.dz }, b2 = { q: q + d.dq * 2, z: z + d.dz * 2 }, c = { q: q + d.dq * 3, z: z + d.dz * 3 };
+    if (exists(a.q, a.z) && exists(b2.q, b2.z) && exists(c.q, c.z) &&
+        getStone(a.q, a.z, b) === opp && getStone(b2.q, b2.z, b) === opp && getStone(c.q, c.z, b) === player) {
+      groups.push([a, b2]);
+    }
+  }
+  const flat = [], seen = new Set();
+  for (const g of groups)
+    for (const c of g) {
+      const k = key(c.q, c.z);
+      if (!seen.has(k)) { seen.add(k); flat.push(c); }
+    }
+  return flat;
+}
+
+/* ---------- 엔진 연결 ---------- */
+const ENGINE_SRC =
+  "const E=(" + BokuEngineFactory.toString() + ")();" +
+  "onmessage=function(e){var d=e.data,res;try{res=E.think(d.board,d.side,d.blocked,d.level);}catch(err){res={error:String(err)};}postMessage({id:d.id,res:res});};";
+let engineWorker = null, engineLocal = null, engineReqId = 0, enginePending = null, workerBroken = false;
+
+function thinkLocally(req, resolve) {
+  if (!engineLocal) engineLocal = BokuEngineFactory();
+  setTimeout(() => {
+    let res;
+    try { res = engineLocal.think(req.board, req.side, req.blocked, req.level); } catch (err) { res = { error: String(err) }; }
+    resolve(res);
+  }, 20);
+}
+function getWorker() {
+  if (engineWorker || workerBroken) return engineWorker;
+  try {
+    const url = URL.createObjectURL(new Blob([ENGINE_SRC], { type: "text/javascript" }));
+    engineWorker = new Worker(url);
+    engineWorker.onmessage = (e) => {
+      if (enginePending && e.data.id === enginePending.id) {
+        const p = enginePending; enginePending = null; p.resolve(e.data.res);
+      }
+    };
+    engineWorker.onerror = () => {
+      workerBroken = true;
+      try { engineWorker.terminate(); } catch (e) {}
+      engineWorker = null;
+      if (enginePending) { const p = enginePending; enginePending = null; thinkLocally(p.req, p.resolve); }
+    };
+  } catch (e) { workerBroken = true; engineWorker = null; }
+  return engineWorker;
+}
+function cancelEngine() {
+  if (enginePending && engineWorker) { engineWorker.terminate(); engineWorker = null; }
+  enginePending = null;
+}
+function engineThink(req) {
+  return new Promise((resolve) => {
+    const w = getWorker();
+    if (!w) { thinkLocally(req, resolve); return; }
+    const id = ++engineReqId;
+    enginePending = { id, req, resolve };
+    w.postMessage({ id, ...req });
+  });
+}
+function updateEngineInfo(res) {
+  const el = document.getElementById("engineInfo");
+  if (!el) return;
+  if (!res) { el.textContent = "AI 대기 중"; return; }
+  let verdict = "";
+  if (res.why === "win") { el.textContent = "AI: 5목 완성"; return; }
+  if (res.why === "only") { el.textContent = "AI: 둘 수 있는 수가 하나뿐"; return; }
+  if (res.why === "opening") { el.textContent = "AI: 첫 수는 중앙"; return; }
+  if (res.score >= 999000) verdict = "필승 수순 발견";
+  else if (res.score <= -999000) verdict = "막을 수 없는 수 읽음";
+  else verdict = `${res.depth}수 앞까지 읽음`;
+  el.textContent = `AI: ${verdict} (${(res.nodes || 0).toLocaleString()}국면, ${((res.ms || 0) / 1000).toFixed(1)}초)`;
+}
+
+/* ---------- 전적 저장소 ---------- */
+async function storageGet(key) {
+  try {
+    const r = await fetch(`${FIREBASE_DB_URL}/${encodeURIComponent(key)}.json`);
+    if (r.ok) { const data = await r.json(); learnMode = "firebase"; return data; }
+  } catch (e) {}
+  learnMode = "local";
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : null; } catch (e) { return null; }
+}
+async function storageSet(key, value) {
+  try {
+    const r = await fetch(`${FIREBASE_DB_URL}/${encodeURIComponent(key)}.json`, {
+      method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value),
+    });
+    if (r.ok) { learnMode = "firebase"; return true; }
+  } catch (e) {}
+  learnMode = "local";
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+  return false;
+}
+function defaultLearn() {
+  const L = {};
+  for (const k of LEVEL_KEYS) L[k] = { games: 0, wins: 0, losses: 0 };
+  return L;
+}
+async function loadLearn() {
+  const data = await storageGet(LEARN_KEY);
+  LEARN = data || defaultLearn();
+  for (const k of LEVEL_KEYS)
+    if (!LEARN[k]) LEARN[k] = { games: 0, wins: 0, losses: 0 };
+  learnReady = true;
+  updateLearnUI();
+}
+async function saveLearn() { await storageSet(LEARN_KEY, LEARN); }
+function updateLearnUI() {
+  const rec = document.getElementById("learnRecord");
+  if (!rec) return;
+  if (!learnReady || !LEARN) { rec.textContent = "불러오는 중…"; return; }
+  const L = LEARN[diffEl.value], tag = learnMode === "firebase" ? "[웹 공유]" : "[내 기기]";
+  rec.textContent = `${tag} AI ${L.games}전 ${L.wins}승 ${L.losses}패`;
+}
+
+async function recordGameResult(winner) {
+  if (modeEl.value !== "ai" || !learnReady || !LEARN) return;
+  const ai = other(Number(sideEl.value));
+  const L = LEARN[diffEl.value];
+  L.games = (L.games || 0) + 1;
+  if (winner === ai) L.wins = (L.wins || 0) + 1;
+  else if (winner) L.losses = (L.losses || 0) + 1;
+  await saveLearn();
+  updateLearnUI();
+}
+
+/* ---------- 렌더 / 상태 ---------- */
+function render() {
+  document.querySelectorAll("#hex-grid .cell").forEach((cell) => {
+    const q = +cell.dataset.q, z = +cell.dataset.z;
+    cell.className = "cell";
+    const v = getStone(q, z);
+    if (v === 1) cell.classList.add("has-stone", "p1");
+    if (v === 2) cell.classList.add("has-stone", "p2");
+    if (lastPlaced && lastPlaced.q === q && lastPlaced.z === z) cell.classList.add("last-placed");
+    if (captureMode && captureCandidates.some((c) => c.q === q && c.z === z)) cell.classList.add("capture-choice");
+    if (isForbiddenToPlace(q, z)) cell.classList.add("blocked");
+  });
+  document.getElementById("score-p1").textContent = scores[0];
+  document.getElementById("score-p2").textContent = scores[1];
+}
+
+function highlightWin(cells) {
+  document.querySelectorAll("#hex-grid .cell").forEach((el) => {
+    const q = +el.dataset.q, z = +el.dataset.z;
+    if (cells.some((c) => c.q === q && c.z === z)) el.classList.add("win-stone");
+  });
+}
+
+function updateStatus() {
+  const dot = document.getElementById("turn-dot"), label = document.getElementById("turn-label"), indicator = document.getElementById("turn-indicator"), msg = document.getElementById("msg");
+  dot.className = "stone-dot " + (currentPlayer === 1 ? "p1" : "p2");
+  label.textContent = currentPlayer === 1 ? "홍의 차례" : "청의 차례";
+  indicator.className = "turn-indicator " + (currentPlayer === 1 ? "black" : "white");
+  
+  if (isDraw) { msg.textContent = "무승부! (보드 가득 참)"; msg.className = "msg"; }
+  else if (gameOver) { msg.textContent = "게임 종료"; msg.className = "msg win"; }
+  else if (captureMode && captureCandidates.length) { msg.textContent = `제거할 돌 ${captureCandidates.length}개 중 하나를 클릭하세요! (Ctrl+Z로 무르기 가능)`; msg.className = "msg alert"; }
+  else if (aiThinking) { msg.textContent = "AI 생각 중…"; msg.className = "msg"; }
+  else if (modeEl.value === "ai") { msg.textContent = currentPlayer === Number(sideEl.value) ? "내 차례" : "AI 차례"; msg.className = "msg"; }
+  else { msg.textContent = ""; msg.className = "msg"; }
+}
+
+/* ---------- 착수 / 제거 / 흐름 ---------- */
+function executeRemove(q, z) {
+  if (!captureMode || !captureCandidates.some((c) => c.q === q && c.z === z)) return;
+  setStone(q, z, 0);
+  blockedCell = { q, z };
+  captureMode = false; captureCandidates = [];
+  addLog("말 제거 → 상대방 차례입니다.");
+  currentPlayer = other(currentPlayer);
+  render(); updateStatus();
+  if (modeEl.value === "ai" && currentPlayer !== Number(sideEl.value)) setTimeout(aiMove, 30);
+}
+
+function placeStone(q, z, p, isAI = false) {
+  history.push(snapshot());
+  blockedCell = null;
+  setStone(q, z, p);
+  lastPlaced = { q, z };
+  
+  const win = checkWin(q, z, p);
+  if (win) {
+    gameOver = true; scores[p - 1]++;
+    render(); highlightWin(win);
+    addLog(`${p === 1 ? "홍" : "청"} 승리!`);
+    updateStatus(); recordGameResult(p);
+    return;
+  }
+  
+  const caps = findCaptures(q, z, p);
+  if (caps.length) {
+    captureCandidates = caps; captureMode = true;
+    addLog(`샌드위치! ${caps.length}개 중 하나를 제거하세요.`);
+    render(); updateStatus();
+    if (isAI) {
+      const ep = gameEpoch;
+      setTimeout(() => {
+        if (ep !== gameEpoch || !captureMode) return;
+        let ch = pendingAIRemove && captureCandidates.find((c) => c.q === pendingAIRemove.q && c.z === pendingAIRemove.z);
+        if (!ch) ch = captureCandidates[0];
+        pendingAIRemove = null;
+        executeRemove(ch.q, ch.z);
+      }, 450);
+    }
+    return;
+  }
+  
+  if (board.size === CELLS.length) {
+    gameOver = true; isDraw = true; render();
+    addLog("무승부! 보드가 가득 찼습니다."); updateStatus();
+    recordGameResult(0);
+    return;
+  }
+  
+  currentPlayer = other(p);
+  render(); updateStatus();
+  if (modeEl.value === "ai" && currentPlayer !== Number(sideEl.value)) setTimeout(aiMove, 30);
+}
+
+function play(q, z) {
+  if (gameOver || aiThinking) return;
+  if (captureMode) {
+    if (currentPlayer !== Number(sideEl.value) && modeEl.value === "ai") return;
+    if (captureCandidates.some((c) => c.q === q && c.z === z)) executeRemove(q, z);
+    else alert("제거 후보로 표시된 돌을 클릭해주세요!");
+    return;
+  }
+  if (modeEl.value === "ai" && currentPlayer !== Number(sideEl.value)) return;
+  if (getStone(q, z) !== 0) { alert("이미 돌이 놓인 자리입니다."); return; }
+  if (isForbiddenToPlace(q, z)) { alert("배치 금지 자리입니다. 다음 차례부터 놓을 수 있습니다."); return; }
+  placeStone(q, z, currentPlayer, false);
+}
+
+function firstLegalCell() {
+  for (const c of CELLS) if (getStone(c.q, c.z) === 0 && !isForbiddenToPlace(c.q, c.z)) return c;
+  return null;
+}
+
+function aiMove() {
+  if (gameOver || modeEl.value !== "ai" || captureMode || aiThinking) return;
+  const ai = other(Number(sideEl.value));
+  if (currentPlayer !== ai) return;
+  aiThinking = true; updateStatus();
+  const ep = gameEpoch, t0 = Date.now();
+  const req = {
+    board: CELLS.map((c) => getStone(c.q, c.z)),
+    side: ai,
+    blocked: blockedCell ? cellIndex.get(key(blockedCell.q, blockedCell.z)) : -1,
+    level: diffEl.value,
+  };
+  engineThink(req).then((res) => {
+    if (ep !== gameEpoch) return;
+    const wait = Math.max(0, 300 - (Date.now() - t0));
+    setTimeout(() => {
+      if (ep !== gameEpoch) return;
+      aiThinking = false;
+      if (gameOver || currentPlayer !== ai || captureMode) { updateStatus(); return; }
+      let c = res && !res.error ? CELLS[res.i] : null;
+      if (res && res.error) addLog("AI 오류: " + res.error);
+      if (!c || getStone(c.q, c.z) !== 0 || isForbiddenToPlace(c.q, c.z)) c = firstLegalCell();
+      if (!c) { updateStatus(); return; }
+      pendingAIRemove = res && res.r >= 0 ? CELLS[res.r] : null;
+      updateEngineInfo(res && !res.error ? res : null);
+      placeStone(c.q, c.z, ai, true);
+    }, wait);
+  });
+}
+
+function newGame() {
+  gameEpoch++; cancelEngine();
+  board = new Map(); currentPlayer = 1; gameOver = false; isDraw = false;
+  captureMode = false; captureCandidates = []; pendingGroups = []; lastPlaced = null; pendingAIRemove = null;
+  blockedCell = null; history = []; aiThinking = false; logEl.innerHTML = "";
+  addLog("게임 시작"); render(); updateStatus(); updateLearnUI(); updateEngineInfo(null);
+  if (modeEl.value === "ai" && Number(sideEl.value) === 2) setTimeout(aiMove, 100);
+}
+
+function undo() {
+  if (gameOver || aiThinking || !history.length) return;
+  if (captureMode) {
+    // AI가 제거를 고르는 중에는 무르기 불가
+    if (modeEl.value === "ai" && currentPlayer !== Number(sideEl.value)) return;
+    const s = history.pop(); restoreSnapshot(s);
+    render(); updateStatus(); addLog("배치 취소 (한 수 무름)"); return;
+  }
+  let n = modeEl.value === "ai" && history.length >= 2 ? 2 : 1;
+  while (n-- && history.length) restoreSnapshot(history.pop());
+  render(); updateStatus(); addLog("한 수 무름");
+  if (modeEl.value === "ai" && currentPlayer !== Number(sideEl.value)) setTimeout(aiMove, 30);
+}
+
+async function resetLearnData() {
+  if (!currentIsAdmin()) { alert("관리자만 AI 전적을 초기화할 수 있습니다."); return; }
+  if (!confirm("모든 난이도의 AI 전적을 초기화할까요? 이 보드를 쓰는 모든 사람에게 적용됩니다.")) return;
+  LEARN = defaultLearn(); await saveLearn(); updateLearnUI(); addLog("AI 전적 초기화됨");
+}
+
+function initBoardDOM() {
+  const grid = document.getElementById("hex-grid"); grid.innerHTML = "";
+  for (let i = 0; i < WIDTHS.length; i++) {
+    const z = i - MID, rowCells = CELLS.filter((c) => c.z === z).sort((a, b) => a.q - b.q);
+    const row = document.createElement("div"); row.className = "hex-row";
+    for (const c of rowCells) {
+      const cell = document.createElement("div"); cell.className = "cell"; cell.dataset.q = c.q; cell.dataset.z = c.z;
+      const inner = document.createElement("div"); inner.className = "cell-inner"; cell.appendChild(inner);
+      cell.addEventListener("click", () => play(c.q, c.z)); row.appendChild(cell);
+    }
+    grid.appendChild(row);
+  }
+}
+
+document.addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") { e.preventDefault(); undo(); } });
+document.getElementById("btn-reset").onclick = newGame;
+document.getElementById("btn-undo").onclick = undo;
+document.getElementById("btn-reset-learn").onclick = resetLearnData;
+modeEl.onchange = newGame; sideEl.onchange = newGame;
+diffEl.onchange = () => { newGame(); updateLearnUI(); };
+
+async function initApp() {
+  initBoardDOM();
+  renderAuth();
+  const savedSession = getSession();
+  if (savedSession) {
+    const users = await loadUsersRemote();
+    if (users[savedSession]) {
+      currentUserIsAdmin = users[savedSession].admin;
+      enterGame(savedSession);
+    } else {
+      authScreen.style.display = "flex";
+      gameScreen.style.display = "none";
+    }
+  } else {
+    authScreen.style.display = "flex";
+    gameScreen.style.display = "none";
+  }
+}
+
+initApp();
+</script>
+</body>
+</html>
+    gap: 20px;
+  }
+
+  header {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+  }
+
+  h1 {
+    font-family: 'DM Mono', monospace;
+    font-size: 2rem;
+    font-weight: 300;
+    letter-spacing: 0.3em;
+    color: var(--accent);
+  }
+
+  .subtitle {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    letter-spacing: 0.1em;
+  }
+
+  .status-bar {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.8rem;
+    min-height: 36px;
+  }
+
+  .turn-indicator {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 14px;
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    transition: border-color 0.2s;
+  }
+
+  .turn-indicator.black { border-color: #555; }
+  .turn-indicator.white { border-color: #999; }
+
+  .stone-dot {
+    width: 14px;
+    height: 14px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .stone-dot.black { background: var(--red-stone); border: 1px solid #7a2520; }
+  .stone-dot.white { background: var(--blue-stone); border: 1px solid #1e3d6e; }
+
+  .stone-dot.p1 { background: var(--red-stone); border: 2px solid #7a2520; }
+  .stone-dot.p2 { background: var(--blue-stone); border: 2px solid #1e3d6e; }
+
+  .msg {
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    transition: color 0.2s;
+  }
+  .msg.alert { color: var(--capture-glow); }
+  .msg.win { color: var(--win-glow); }
+
+  /* Board */
+  .board-wrap {
+    overflow-x: auto;
+    padding: 8px;
+    max-width: 100%;
+  }
+
+  #board {
+    position: relative;
+    display: inline-block;
+  }
+
+  .hex-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    position: relative;
+    z-index: 1;
+    align-items: center;
+  }
+
+  .hex-row {
+    display: flex;
+    justify-content: center;
+    margin-top: calc(var(--cell-size) * -0.06);
+  }
+  .hex-row:first-child { margin-top: 0; }
+
+  .cell {
+    width: var(--cell-size);
+    height: calc(var(--cell-size) * 0.866);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+  }
+
+  .cell-inner {
+    width: calc(var(--cell-size) * 0.7);
+    height: calc(var(--cell-size) * 0.7);
+    border-radius: 50%;
+    border: 1px solid #3a3a3a;
+    background: var(--surface);
+    transition: background 0.1s, transform 0.1s, box-shadow 0.1s;
+    position: relative;
+    z-index: 2;
+  }
+
+  .cell:hover .cell-inner {
+    border-color: var(--accent);
+    transform: scale(1.12);
+  }
+
+  .cell.has-stone .cell-inner {
+    border: none;
+  }
+
+  .cell.p1 .cell-inner {
+    background: radial-gradient(circle at 35% 30%, var(--red-stone-hi), var(--red-stone) 70%);
+    border: 1px solid #7a2520;
+    box-shadow: inset 0 1px 2px rgba(255,255,255,0.25), 0 2px 6px rgba(0,0,0,0.5);
+  }
+
+  .cell.p2 .cell-inner {
+    background: radial-gradient(circle at 35% 30%, var(--blue-stone-hi), var(--blue-stone) 70%);
+    border: 1px solid #1e3d6e;
+    box-shadow: inset 0 1px 2px rgba(255,255,255,0.25), 0 2px 6px rgba(0,0,0,0.5);
+  }
+
+  .cell.capture-choice .cell-inner {
+    animation: glow-capture 1.4s ease-in-out infinite alternate;
+    cursor: pointer;
+  }
+
+  @keyframes glow-capture {
+    from { box-shadow: 0 0 3px 1px rgba(224,92,58,0.4); }
+    to   { box-shadow: 0 0 8px 2px rgba(224,92,58,0.9); }
+  }
+
+  .cell.win-stone .cell-inner {
+    box-shadow: 0 0 0 3px var(--win-glow);
+  }
+
+  .cell.blocked .cell-inner {
+    border-color: var(--capture-glow);
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .cell.last-placed .cell-inner::after {
+    content: '';
+    position: absolute;
+    inset: 25%;
+    border-radius: 50%;
+    background: rgba(200,169,110,0.4);
+  }
+
+  /* Controls */
+  .controls {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  button {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    padding: 7px 18px;
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--text-dim);
+    cursor: pointer;
+    border-radius: 2px;
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  button:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+  }
+
+  #btn-reset-learn:hover {
+    color: var(--capture-glow);
+    border-color: var(--capture-glow);
+  }
+
+  /* Score */
+  .score-row {
+    display: flex;
+    gap: 24px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+  }
+  .score-item { display: flex; gap: 8px; align-items: center; }
+  .score-item span:last-child { color: var(--text); font-size: 0.95rem; }
+
+  /* Screens */
+  #auth-screen, #game-screen {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+  }
+  #auth-screen { gap: 28px; justify-content: center; min-height: 80vh; }
+  #game-screen { gap: 20px; }
+
+  /* ---------- User / admin bar ---------- */
+  #user-bar {
+    position: fixed;
+    top: 10px;
+    right: 12px;
+    z-index: 60;
+    display: none;
+    align-items: center;
+    gap: 8px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+  }
+
+  .user-chip {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    padding: 5px 12px;
+    border: 1px solid var(--border);
+    background: rgba(26,26,26,0.9);
+    border-radius: 2px;
+    color: var(--text);
+    letter-spacing: 0.05em;
+  }
+
+  .admin-badge {
+    color: var(--accent);
+    border: 1px solid #5a4b2e;
+    background: rgba(200,169,110,0.08);
+    padding: 1px 7px;
+    border-radius: 2px;
+    font-size: 0.62rem;
+    letter-spacing: 0.12em;
+    white-space: nowrap;
+  }
+
+  #user-bar button {
+    padding: 5px 12px;
+    font-size: 0.68rem;
+    background: rgba(26,26,26,0.9);
+  }
+
+  /* ---------- Auth screen ---------- */
+  .auth-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 36px 40px 32px;
+    width: min(380px, 100%);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .auth-card h2 {
+    font-family: 'DM Mono', monospace;
+    font-weight: 300;
+    font-size: 1.05rem;
+    letter-spacing: 0.25em;
+    color: var(--text);
+  }
+
+  .auth-desc {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .auth-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .auth-input {
+    width: 100%;
+    padding: 9px 10px;
+    background: transparent;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.78rem;
+    transition: border-color 0.15s;
+  }
+  .auth-input:focus { outline: none; border-color: var(--accent); }
+  .auth-input::placeholder { color: #555; }
+
+  .auth-error {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--capture-glow);
+    line-height: 1.5;
+  }
+
+  .auth-note {
+    font-size: 0.68rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+    border-left: 2px solid var(--accent);
+    padding-left: 10px;
+  }
+
+  .auth-card .auth-submit {
+    color: var(--text);
+    border-color: var(--accent);
+    padding: 10px 24px;
+    margin-top: 4px;
+  }
+  .auth-card .auth-submit:hover { color: var(--accent); }
+
+  .auth-card .auth-switch {
+    border: none;
+    font-size: 0.7rem;
+    padding: 4px;
+    align-self: center;
+  }
+
+  .auth-foot {
+    font-family: 'DM Mono', monospace;
+    font-size: 0.66rem;
+    color: #4c4c4c;
+    letter-spacing: 0.06em;
+  }
+
+  /* ---------- Overlay (가입자 목록) ---------- */
+  .overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+  .overlay.show { display: flex; }
+
+  .overlay-box {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 28px 32px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    min-width: 280px;
+    max-width: 420px;
+    width: 100%;
+  }
+
+  .overlay-box h2 {
+    font-family: 'DM Mono', monospace;
+    font-weight: 300;
+    font-size: 1rem;
+    letter-spacing: 0.2em;
+    color: var(--accent);
+  }
+
+  .overlay-box .panel-desc {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    line-height: 1.6;
+  }
+
+  .admin-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 240px;
+    overflow: auto;
+    text-align: left;
+  }
+
+  .admin-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    border: 1px solid var(--border);
+    padding: 8px 12px;
+    font-family: 'DM Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--text);
+  }
+
+  .admin-row .who {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .admin-row .me-tag {
+    color: var(--text-dim);
+    font-size: 0.66rem;
+    flex-shrink: 0;
+  }
+
+  .admin-row button {
+    padding: 4px 12px;
+    font-size: 0.66rem;
+    flex-shrink: 0;
+  }
+
+  .admin-row button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .admin-row button:disabled:hover {
+    color: var(--text-dim);
+    border-color: var(--border);
+  }
+
+  .overlay-box .close-btn {
+    align-self: center;
+    padding: 8px 24px;
+  }
+
+  @media (max-width: 640px) {
+    :root { --cell-size: 33px; }
+    #user-bar {
+      position: static;
+      justify-content: center;
+      width: 100%;
+      flex-wrap: wrap;
+    }
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ 상단 유저바 ============ -->
+<div id="user-bar">
+  <div class="user-chip">
+    <span id="ub-name"></span>
+    <span class="admin-badge" id="ub-badge" style="display:none;">관리자</span>
+  </div>
+  <button id="btn-user-list" title="가입자 목록 조회">가입자 목록</button>
+  <button id="btn-logout" title="로그아웃">로그아웃</button>
+</div>
+
+<!-- ============ 회원가입 / 로그인 화면 ============ -->
+<div id="auth-screen">
+  <header>
+    <h1>BOKU</h1>
+    <span class="subtitle">로컬 2인 대전</span>
+  </header>
+
+  <div class="auth-card">
+    <h2 id="auth-title">회원가입</h2>
+    <p class="auth-desc" id="auth-desc">게임을 시작하려면 아이디와 비밀번호를 만들어주세요.</p>
+
+    <form class="auth-form" id="auth-form">
+      <input class="auth-input" id="auth-id" placeholder="아이디" autocomplete="username">
+      <input class="auth-input" id="auth-pw" type="password" placeholder="비밀번호">
+      <input class="auth-input" id="auth-pw2" type="password" placeholder="비밀번호 확인">
+      <div class="auth-error" id="auth-error" style="display:none;"></div>
+      <p class="auth-note" id="auth-note">
+        계정 정보는 실시간 데이터베이스에 안전하게 보관되어 다른 기기에서도 로그인할 수 있습니다.<br>
+        서버에 등록되는 최초의 계정이 자동으로 최고 관리자가 됩니다.
+      </p>
+      <button class="auth-submit" type="submit" id="auth-submit">가입하기</button>
+      <button class="auth-switch" type="button" id="auth-switch">이미 계정이 있나요? 로그인</button>
+    </form>
+  </div>
+</div>
+
+<!-- ============ 게임 화면 ============ -->
+<div id="game-screen" style="display:none;">
+  <header>
+    <h1>BOKU</h1>
+    <span class="subtitle">로컬 2인 대전</span>
+  </header>
+
+  <div class="score-row">
+    <div class="score-item">
+      <div class="stone-dot p1"></div>
+      <span>홍</span>
+      <span id="score-p1">0</span>
+    </div>
+    <div class="score-item">
+      <div class="stone-dot p2"></div>
+      <span>청</span>
+      <span id="score-p2">0</span>
+    </div>
+  </div>
+
+  <div class="status-bar">
+    <div class="turn-indicator" id="turn-indicator">
+      <div class="stone-dot p1" id="turn-dot"></div>
+      <span id="turn-label">홍의 차례</span>
+    </div>
+    <span class="msg" id="msg"></span>
+  </div>
+
+  <div class="board-wrap">
+    <div id="board">
+      <div class="hex-grid" id="hex-grid"></div>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="btn-reset">새 게임</button>
+    <button id="btn-undo">한 수 무르기</button>
     <button id="btn-reset-learn" style="display:none;">AI 학습 데이터 초기화</button>
   </div>
 
